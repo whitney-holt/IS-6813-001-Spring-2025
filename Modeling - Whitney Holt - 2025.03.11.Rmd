@@ -1,0 +1,657 @@
+---
+title: "IS 6813 Modeling"
+author: "Whitney Holt"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r include=FALSE, echo = FALSE, warnings = FALSE, message = FALSE}
+library(tidyverse)
+library(knitr)
+library(readxl)
+library(Metrics)
+library(caret)
+library(glmnet)
+```
+
+# Introduction
+
+## Business Problem Statement
+
+Swire Coca-Cola (SCCU) aims to optimize delivery logistics by shifting low-volume customers to cost-efficient Alternate Routes to Market (ARTM/ white
+truck delivery) using third-party services. However, this may inadvertently move high-growth potential customers to less personalized service, risking
+revenue loss and weaker relationships. The purpose of this project is to establish a reliable, data-informed systematic method to identify and predict
+high-potential customers, balancing efficiency with sustainable growth.
+
+## Discussion of Modeling
+
+A supervised machine learning model will be used to predict total annual delivery cost per customer. By leveraging historical sales and delivery data, it will help identify ARTM customers with potential for volume growth, ensuring cost-efficient truck assignments and forecasting high-cost customers before they exceed thresholds. The model is trained using one year of data as the training set and the next year as the test set, with key features such as order volume, delivery success rate, and trade channel. Performance will be evaluated based on key metrics such as RMSE, R², and MAPE to evaluate the model's accuracy. 
+
+Once the calculations and predictions are complete, unsupervised learning (clustering) can be used to segment deliveries into White Truck vs. Red Truck categories based on key logistics variables. 
+
+A dashboard will then be constructed to illustrate results. The goal of this dashboard is to help logistics teams and operations managers classify deliveries into White Truck vs. Red Truck based on key order attributes. By integrating clustering techniques, this dashboard will automate truck assignments, reduce delivery costs, and improve operational efficiency. Ultimately, the desire is to determine how to integrate the insights into a routine strategy to support long-term growth while maintaining logistical efficiency.  
+
+# Modeling
+
+## Preprocessing
+
+### Loading & Joining Data
+
+Loading in data sets:
+
+```{r}
+# Import data sets
+transactional_data <- read.csv(file = "transactional_data.csv", stringsAsFactors = TRUE)
+customer_profile <- read.csv(file = "customer_profile.csv", stringsAsFactors = TRUE)
+customer_address_and_zip_mapping <- read.csv(file = "customer_address_and_zip_mapping.csv", stringsAsFactors = TRUE)
+delivery_cost_data <- read_excel("delivery_cost_data.xlsx")
+```
+
+Combining transaction and customer data into one data set:
+
+```{r}
+# Join transactional and customer profile data
+transaction_customer_data <- transactional_data %>%
+                             left_join(customer_profile, by = c("CUSTOMER_NUMBER" = "CUSTOMER_NUMBER"))
+
+# Join customer address data
+transaction_customer_data <- transaction_customer_data %>%
+                             left_join(customer_address_and_zip_mapping, by = c("ZIP_CODE" = "zip"))
+```
+
+### Feature Engineering from the EDA
+
+Creating new variables from Exploratory Data Analysis (EDA):
+
+**Total Units Ordered**
+
+ - Description: used to quantify total units ordered, which are then used to determine when a threshold is reached
+ - Calculation: sum of two existing variables
+
+```{r}
+# Total Units Ordered
+transaction_customer_data$TOTAL_UNITS_ORDERED <- transaction_customer_data$ORDERED_GALLONS + transaction_customer_data$ORDERED_CASES
+```
+
+**Total Units Loaded**
+
+ - Description: used to quantify total units loaded
+ - Calculation: sum of two existing variables
+
+```{r}
+# Total Units Loaded
+transaction_customer_data$TOTAL_UNITS_LOADED <- transaction_customer_data$LOADED_GALLONS + transaction_customer_data$LOADED_CASES
+```
+
+**Total Units Delivered**
+
+ - Description: used to quantify total units delivered
+ - Calculation: sum of two existing variables
+
+```{r}
+# Total Units Loaded
+transaction_customer_data$TOTAL_UNITS_DELIVERED <- transaction_customer_data$DELIVERED_GALLONS + transaction_customer_data$DELIVERED_CASES
+```
+
+**Order Grouping**
+
+ - Description: used to identify customers who are ordering less or more than 400 units per year
+ - Calculation: logical statement utilizing level of detail (LOD) calculation functionality
+
+```{r}
+transaction_customer_data$ORDER_GROUPING <- (transaction_customer_data %>%
+                                            group_by(YEAR, CUSTOMER_NUMBER) %>%
+                                            mutate(TOTAL_UNITS_ORDERED = sum(TOTAL_UNITS_ORDERED)) %>%
+                                            ungroup() %>%
+                                            mutate(ORDER_GROUPING = as.factor(ifelse(TOTAL_UNITS_ORDERED < 400, 
+                                                                                                'Customers Ordering Less than 400', 
+                                                                                                'Customers Ordering More than 400'))))$ORDER_GROUPING
+```
+
+**Customer Group Number (Rollup)**
+
+- Description: used to aggregate transactions up to the customer group number, if desired
+- Calculation: logical statement using two existing variables
+
+```{r}
+transaction_customer_data$CUSTOMER_GROUP_NUMBER_ROLLUP <- ifelse(!is.na(transaction_customer_data$PRIMARY_GROUP_NUMBER), 
+                                                                 transaction_customer_data$PRIMARY_GROUP_NUMBER, 
+                                                                 transaction_customer_data$CUSTOMER_NUMBER)
+```
+
+### New Feature Engineering: Calculating Delivery Cost per Customer
+
+Steps provided by SWIRE:
+
+ 1. Determine the volume range for each category (Fountain and Bottles/ Cans)
+ 2. Retrieve the median delivery cost per unit from the data set.
+ 3. Multiply the cost per unit by the quantity purchased for each category.
+ 4. Sum the delivery costs to get the total.
+ 
+We'll start by calculating the total volume purchased by each customer in each category per year. 
+
+```{r}
+# Summarize the total volume purchased for each category
+annual_volume <- transaction_customer_data %>%
+  group_by(YEAR, CUSTOMER_NUMBER, COLD_DRINK_CHANNEL) %>%
+  summarize(
+    Total_Fountain = sum(ORDERED_GALLONS),
+    Total_Bottles_Cans = sum(ORDERED_CASES)
+  ) %>%
+  ungroup()
+
+# View the result
+head(annual_volume, n = 5)
+tail(annual_volume, n = 5)
+```
+
+Next, we need to determine the range each fountain and bottle/ can value falls into, writing a function to do so.
+
+```{r}
+# Ensure Vol Range is a character
+delivery_costs <- delivery_cost_data %>%
+  mutate(`Vol Range` = as.character(`Vol Range`))
+
+# Function to get the delivery cost based on volume range
+get_delivery_cost <- function(volume, category, channel) {
+  if (volume >= 0 & volume <= 149) {
+    cost <- delivery_costs %>%
+      filter(`Cold Drink Channel` == channel, `Applicable To` == category, `Vol Range` == "0 - 149") %>%
+      select(`Median Delivery Cost`) %>%
+      pull()
+  } else if (volume >= 150 & volume <= 299) {
+    cost <- delivery_costs %>%
+      filter(`Cold Drink Channel` == channel, `Applicable To` == category, `Vol Range` == "150 - 299") %>%
+      select(`Median Delivery Cost`) %>%
+      pull()
+  } else if (volume >= 300 & volume <= 449) {
+    cost <- delivery_costs %>%
+      filter(`Cold Drink Channel` == channel, `Applicable To` == category, `Vol Range` == "300 - 449") %>%
+      select(`Median Delivery Cost`) %>%
+      pull()
+  } else if (volume >= 450 & volume <= 599) {
+    cost <- delivery_costs %>%
+      filter(`Cold Drink Channel` == channel, `Applicable To` == category, `Vol Range` == "450 - 599") %>%
+      select(`Median Delivery Cost`) %>%
+      pull()
+  } else if (volume >= 600 & volume <= 749) {
+    cost <- delivery_costs %>%
+      filter(`Cold Drink Channel` == channel, `Applicable To` == category, `Vol Range` == "600 - 749") %>%
+      select(`Median Delivery Cost`) %>%
+      pull()
+  } else if (volume >= 750 & volume <= 899) {
+    cost <- delivery_costs %>%
+      filter(`Cold Drink Channel` == channel, `Applicable To` == category, `Vol Range` == "750 - 899") %>%
+      select(`Median Delivery Cost`) %>%
+      pull()
+  } else if (volume >= 900 & volume <= 1049) {
+    cost <- delivery_costs %>%
+      filter(`Cold Drink Channel` == channel, `Applicable To` == category, `Vol Range` == "900 - 1049") %>%
+      select(`Median Delivery Cost`) %>%
+      pull()
+  } else if (volume >= 1050 & volume <= 1199) {
+    cost <- delivery_costs %>%
+      filter(`Cold Drink Channel` == channel, `Applicable To` == category, `Vol Range` == "1050 - 1199") %>%
+      select(`Median Delivery Cost`) %>%
+      pull()
+  } else if (volume >= 1200 & volume <= 1349) {
+    cost <- delivery_costs %>%
+      filter(`Cold Drink Channel` == channel, `Applicable To` == category, `Vol Range` == "1200 - 1349") %>%
+      select(`Median Delivery Cost`) %>%
+      pull()
+  } else if (volume >= 1350) {
+    cost <- delivery_costs %>%
+      filter(`Cold Drink Channel` == channel, `Applicable To` == category, `Vol Range` == "1350+") %>%
+      select(`Median Delivery Cost`) %>%
+      pull()
+  } else {
+    cost <- 0
+  }
+  return(ifelse(length(cost) > 0, cost, 0))
+}
+```
+
+Next, we'll calculate the total delivery cost for each customer.
+
+```{r}
+# Calculate the total delivery cost for each customer
+annual_volume <- annual_volume %>%
+  rowwise() %>%
+  mutate(
+    Fountain_Cost = get_delivery_cost(Total_Fountain, "Fountain", COLD_DRINK_CHANNEL) * Total_Fountain,
+    Bottles_Cans_Cost = get_delivery_cost(Total_Bottles_Cans, "Bottles and Cans", COLD_DRINK_CHANNEL) * Total_Bottles_Cans,
+    Total_Delivery_Cost = Fountain_Cost + Bottles_Cans_Cost
+  ) %>%
+  ungroup()
+
+# View the result
+head(annual_volume, n = 5)
+tail(annual_volume, n = 5)
+```
+
+Last, we'll add the total delivery cost column to our main data set.
+
+```{r}
+# Merge the total delivery cost back into the transaction_customer_data table
+transaction_customer_data <- transaction_customer_data %>%
+  left_join(annual_volume %>% select(CUSTOMER_NUMBER, YEAR, Total_Delivery_Cost), 
+            by = c("CUSTOMER_NUMBER" = "CUSTOMER_NUMBER", "YEAR" = "YEAR"))
+
+# View the result
+head(transaction_customer_data, n = 5)
+tail(transaction_customer_data, n = 5)
+```
+
+## Defining Train & Test Sets
+
+Because some customers have data in just 2023 or 2024, we want to make sure we split those customers into train and test sets proportionately.
+
+The plan is to:
+
+ - Identify customers with data in 2023, 2024, both years, and only one of the years.
+ - Split the customers into train and test sets based on the specified proportions.
+ - Create the train and test sets using the transaction_customer_data table.
+ 
+```{r}
+# Identify customers with data in 2023 and 2024
+customers_2023 <- transaction_customer_data %>%
+  filter(YEAR == 2023) %>%
+  select(CUSTOMER_NUMBER) %>%
+  distinct()
+
+customers_2024 <- transaction_customer_data %>%
+  filter(YEAR == 2024) %>%
+  select(CUSTOMER_NUMBER) %>%
+  distinct()
+
+# Identify customers with data in both years, only 2023, and only 2024
+customers_both_years <- intersect(customers_2023$CUSTOMER_NUMBER, customers_2024$CUSTOMER_NUMBER)
+customers_only_2023 <- setdiff(customers_2023$CUSTOMER_NUMBER, customers_2024$CUSTOMER_NUMBER)
+customers_only_2024 <- setdiff(customers_2024$CUSTOMER_NUMBER, customers_2023$CUSTOMER_NUMBER)
+
+# Function to split customers into train and test sets
+split_customers <- function(customers, train_ratio = 0.7) {
+  set.seed(123) # For reproducibility
+  train_indices <- sample(seq_len(length(customers)), size = floor(train_ratio * length(customers)))
+  train_customers <- customers[train_indices]
+  test_customers <- customers[-train_indices]
+  return(list(train = train_customers, test = test_customers))
+}
+
+# Split customers into train and test sets
+split_both_years <- split_customers(customers_both_years)
+split_only_2023 <- split_customers(customers_only_2023)
+split_only_2024 <- split_customers(customers_only_2024)
+
+# Combine train and test customers
+train_customers <- c(split_both_years$train, split_only_2023$train, split_only_2024$train)
+test_customers <- c(split_both_years$test, split_only_2023$test, split_only_2024$test)
+
+# Create train and test sets
+train_set <- transaction_customer_data %>%
+  filter(CUSTOMER_NUMBER %in% train_customers)
+
+test_set <- transaction_customer_data %>%
+  filter(CUSTOMER_NUMBER %in% test_customers)
+
+# View the results
+print("Train Set:")
+head(train_set, n = 5)
+tail(train_set, n = 5)
+print("Test Set:")
+head(test_set, n = 5)
+tail(test_set, n = 5)
+```
+
+Let's test to make sure each customer (and all of their transactions) end up in either the train set or the test set, and aren't split among the two:
+
+```{r}
+# Check for overlap
+overlap_customers <- intersect(train_customers, test_customers)
+if (length(overlap_customers) == 0) {
+  print("No overlap between train and test customers.")
+} else {
+  print("Overlap found between train and test customers.")
+}
+```
+
+These sets are still quite large let's aggregate each row up to the customer and year level so there is one row per customer per year. This will decrease the time required to create and test the models.
+
+```{r}
+# Assigning columns a group
+dimensions <- c("ORDER_TYPE", 
+                "PRIMARY_GROUP_NUMBER",
+                "FREQUENT_ORDER_TYPE",
+                "FIRST_DELIVERY_DATE",
+                "ON_BOARDING_DATE",
+                "COLD_DRINK_CHANNEL",
+                "TRADE_CHANNEL",
+                "SUB_TRADE_CHANNEL",
+                "LOCAL_MARKET_PARTNER",
+                "CO2_CUSTOMER",
+                "ZIP_CODE",
+                "full.address",
+                "ORDER_GROUPING",
+                "CUSTOMER_GROUP_NUMBER_ROLLUP")
+
+measures <- c("ORDERED_CASES", 
+              "LOADED_CASES", 
+              "DELIVERED_CASES",
+              "ORDERED_GALLONS",
+              "LOADED_GALLONS",
+              "DELIVERED_GALLONS",
+              "TOTAL_UNITS_ORDERED",
+              "TOTAL_UNITS_LOADED",
+              "TOTAL_UNITS_DELIVERED") 
+
+drop_columns <- c("WEEK", 
+                  "TRANSACTION_DATE") 
+
+already_aggregated <- "Total_Delivery_Cost" 
+
+# Aggregate the data
+aggregated_data <- transaction_customer_data %>%
+  select(-one_of(drop_columns)) %>% # Drop unnecessary columns
+  group_by(CUSTOMER_NUMBER, YEAR) %>%
+  summarize(across(all_of(dimensions), first), # Keep dimensions as-is
+            across(all_of(measures), sum, .names = "sum_{col}"), # Sum measures
+            across(all_of(already_aggregated), first)) # Keep already aggregated column as-is
+
+# View the results
+print("Aggregated Data:")
+head(aggregated_data, n = 5)
+tail(aggregated_data, n = 5)
+
+# Aggregate the train set
+aggregated_train_set <- train_set %>%
+  select(-one_of(drop_columns)) %>% # Drop unnecessary columns
+  group_by(CUSTOMER_NUMBER, YEAR) %>%
+  summarize(across(all_of(dimensions), first), # Keep dimensions as-is
+            across(all_of(measures), sum, .names = "sum_{col}"), # Sum measures
+            across(all_of(already_aggregated), first)) # Keep already aggregated column as-is
+
+# Aggregate the test set
+aggregated_test_set <- test_set %>%
+  select(-one_of(drop_columns)) %>% # Drop unnecessary columns
+  group_by(CUSTOMER_NUMBER, YEAR) %>%
+  summarize(across(all_of(dimensions), first), # Keep dimensions as-is
+            across(all_of(measures), sum, .names = "sum_{col}"), # Sum measures
+            across(all_of(already_aggregated), first)) # Keep already aggregated column as-is
+
+# View the results
+print("Aggregated Train Set:")
+head(aggregated_train_set, n = 5)
+tail(aggregated_train_set, n = 5)
+
+print("Aggregated Test Set:")
+head(aggregated_test_set, n = 5)
+tail(aggregated_test_set, n = 5)
+```
+
+Lastly, I want to make sure that I am using 2023 data to predict Total Units ordered in 2024.
+
+```{r}
+# Separate the data into 2023 and 2024 subsets
+train_data_2023 <- aggregated_train_set %>% filter(YEAR == 2023)
+train_data_2024 <- aggregated_train_set %>% filter(YEAR == 2024)
+test_data_2023 <- aggregated_test_set %>% filter(YEAR == 2023)
+test_data_2024 <- aggregated_test_set %>% filter(YEAR == 2024)
+
+# Merge the 2023 and 2024 data based on customer number
+train_merged_data <- merge(train_data_2023, train_data_2024, by = "CUSTOMER_NUMBER", suffixes = c("_2023", "_2024"))
+test_merged_data <- merge(test_data_2023, test_data_2024, by = "CUSTOMER_NUMBER", suffixes = c("_2023", "_2024"))
+
+# Select relevant
+train_set <- train_merged_data %>% select(CUSTOMER_NUMBER, ends_with("_2023"), sum_TOTAL_UNITS_ORDERED_2024)
+test_set <- test_merged_data %>% select(CUSTOMER_NUMBER, ends_with("_2023"), sum_TOTAL_UNITS_ORDERED_2024)
+```
+
+## Performance Benchmark
+
+Performance variables of interest:
+
+ - RMSE
+ - R squared
+ - MAPE
+
+Identify a performance benchmark.  What is a minimum threshold for model performance?
+
+Thre are a few options for a baseline model:
+
+ - Mean Model
+ - Median Model
+ - Simple Linear Regression
+ 
+### Mean Model
+
+Mean Model: simply predicts the mean of the target variable for all observations.
+ 
+```{r}
+# Remove rows with missing values for mean and median models
+train_set_mm <- na.omit(train_set)
+test_set_mm <- na.omit(test_set)
+
+# Calculate the mean of the target variable in the training set
+mean_target <- mean(train_set_mm$sum_TOTAL_UNITS_ORDERED_2024, na.rm = TRUE)
+
+# Predict the mean for all observations in the test set
+mean_predictions <- rep(mean_target, nrow(test_set_mm))
+
+# Calculate RMSE, R-squared, and MAPE for the mean model
+rmse_mean <- RMSE(mean_predictions, test_set_mm$sum_TOTAL_UNITS_ORDERED_2024)
+r_squared_mean <- 1 - sum((test_set_mm$sum_TOTAL_UNITS_ORDERED_2024 - mean_predictions)^2) / sum((test_set_mm$sum_TOTAL_UNITS_ORDERED_2024 - mean(test_set_mm$sum_TOTAL_UNITS_ORDERED_2024))^2)
+mape_mean <- mean(abs((test_set_mm$sum_TOTAL_UNITS_ORDERED_2024 - mean_predictions) / test_set_mm$sum_TOTAL_UNITS_ORDERED_2024)) * 100
+
+# Print the results
+cat("Mean Model Performance:\n")
+cat("RMSE:", rmse_mean, "\n")
+cat("R-squared:", r_squared_mean, "\n")
+cat("MAPE:", mape_mean, "\n")
+```
+
+Mean Model Performance Discussion:
+
+ - *RMSE (Root Mean Squared Error)*: This metric measures the average magnitude of the errors between the predicted and actual values. An RMSE of 7025.563 indicates that, on average, the predictions are off by about 7,026 units. This is quite high, suggesting that the mean model is not very accurate.
+
+ - *R-squared*: This metric indicates the proportion of the variance in the dependent variable that is predictable from the independent variables. An R-squared value of -7.586425e-05  means that the mean model does not explain any of the variance in the data. In fact, it performs worse than a horizontal line.
+
+ - *MAPE (Mean Absolute Percentage Error)*: This metric measures the average percentage error between the predicted and actual values. An infinite MAPE (Inf) suggests that there are some actual values that are zero, leading to division by zero in the calculation. This indicates that the mean model is not suitable for data sets with zero values in the target variable.
+
+### Median Model
+
+Median Model: simply predicts the median of the target variable for all observations. This can be more robust to outliers compared to the mean model.
+
+```{r}
+# Calculate the median of the target variable in the training set
+median_target <- median(train_set_mm$sum_TOTAL_UNITS_ORDERED_2024, na.rm = TRUE)
+
+# Predict the median for all observations in the test set
+median_predictions <- rep(median_target, nrow(test_set_mm))
+
+# Calculate RMSE, R-squared, and MAPE for the median model
+rmse_median <- RMSE(median_predictions, test_set_mm$sum_TOTAL_UNITS_ORDERED_2024)
+r_squared_median <- 1 - sum((test_set_mm$sum_TOTAL_UNITS_ORDERED_2024 - median_predictions)^2) / sum((test_set_mm$sum_TOTAL_UNITS_ORDERED_2024 - mean(test_set_mm$sum_TOTAL_UNITS_ORDERED_2024))^2)
+mape_median <- mean(abs((test_set_mm$sum_TOTAL_UNITS_ORDERED_2024 - median_predictions) / test_set_mm$sum_TOTAL_UNITS_ORDERED_2024)) * 100
+
+# Print the results
+cat("Median Model Performance:\n")
+cat("RMSE:", rmse_median, "\n")
+cat("R-squared:", r_squared_median, "\n")
+cat("MAPE:", mape_median, "\n")
+```
+
+Median Model Performance Discussion:
+
+ - *RMSE (Root Mean Squared Error)*: This metric measures the average magnitude of the errors between the predicted and actual values. An RMSE of 7089.417 indicates that, on average, the predictions are off by about 7,089 units. This is quite high, suggesting that the mean model is not very accurate.
+
+ - *R-squared*: This metric indicates the proportion of the variance in the dependent variable that is predictable from the independent variables. An R-squared value of -0.0183376 is very close to zero and negative, which means that the mean model does not explain any of the variance in the data. In fact, a negative R-squared indicates that the model performs worse than a horizontal line.
+
+ - *MAPE (Mean Absolute Percentage Error)*: his metric measures the average percentage error between the predicted and actual values. An infinite MAPE (Inf) suggests that there are some actual values that are zero, leading to division by zero in the calculation. This indicates that the median model is not suitable for data sets with zero values in the target variable.
+ 
+The median model performed slightly worse than the mean model.
+
+## Appropriate Models
+
+Identify appropriate models to explore (given the business problem and the project objective).
+
+ - Supervised regression models
+    - Linear Regression
+    - RIDGE Regression
+    - LASSO Regression
+    - Elastic Net
+    - Decision Trees
+    - Random Forest
+    - Gradient Boosting Machines (GBM)
+    - Support Vector Regression (SVR)
+    - Neural Networks
+ - Unsupervised models to use after classification is complete
+    - Clustering
+    - Principle Components Analysis (PCA)
+    
+For the sake of time, I will only investigate RIDGE, LASSO, Elastic Net supervised regression, though these other models may have good application, they are less straight forward and are less interpretable. 
+
+## Building Models
+
+I suspect this data has multicollinearity and could have many irrelevant features. For this reason, I am going to skip linear regression and go straight for RIDGE, LASSO, and Elastic Net regression models. These regularization techniques can provide more reliable and interpretable models.
+
+### RIDGE Regression
+
+RIDGE regression adds an L2 penalty (squared magnitude of coefficients) to the loss function, which helps to shrink the coefficients and reduce multicollinearity.
+
+```{r}
+# Remove rows with missing values for Ridge Regression
+train_set_ridge <- na.omit(train_set)
+test_set_ridge <- na.omit(test_set)
+
+# Prepare data for glmnet
+x_train_ridge <- model.matrix(sum_TOTAL_UNITS_ORDERED_2024 ~ ., train_set_ridge)[, -1]
+y_train_ridge <- train_set_ridge$sum_TOTAL_UNITS_ORDERED_2024
+x_test_ridge <- model.matrix(sum_TOTAL_UNITS_ORDERED_2024 ~ ., test_set_ridge)[, -1]
+
+# Ridge Regression
+ridge_model <- cv.glmnet(x_train_ridge, y_train_ridge, alpha = 0)
+ridge_predictions <- predict(ridge_model, s = "lambda.min", newx = x_test_ridge)
+
+rmse_ridge <- RMSE(ridge_predictions, test_set_ridge$sum_TOTAL_UNITS_ORDERED_2024)
+r_squared_ridge <- R2(ridge_predictions, test_set_ridge$sum_TOTAL_UNITS_ORDERED_2024)
+mape_ridge <- mean(abs((test_set_ridge$sum_TOTAL_UNITS_ORDERED_2024 - ridge_predictions) / test_set_ridge$sum_TOTAL_UNITS_ORDERED_2024)) * 100
+
+cat("Ridge Regression Model Performance:\n")
+cat("RMSE:", rmse_ridge, "\n")
+cat("R-squared:", r_squared_ridge, "\n")
+cat("MAPE:", mape_ridge, "\n")
+```
+
+RIDGE Regression Performance Discussion:
+
+ - *RMSE (Root Mean Squared Error)*: An RMSE of 4455.367 indicates that, on average, the predictions are off by about 4,455 units. This is a significant improvement over the mean and median models, suggesting that the Ridge Regression model is more accurate.
+
+ - *R-squared*: An R-squared value of 0.8600118 means that approximately 86.0% of the variance in the target variable is explained by the Ridge Regression model. This is a very high value, indicating that the model fits the data well.
+
+ - *MAPE (Mean Absolute Percentage Error)*: An infinite MAPE (Inf) suggests that there are some actual values that are zero, leading to division by zero in the calculation. This indicates that the Ridge Regression model is not suitable for datasets with zero values in the target variable, similar to the median model.
+
+### LASSO Regression
+
+LASSO Regression adds an L1 penalty (absolute value of coefficients), which can also help with multicollinearity by shrinking some coefficients to zero, effectively performing feature selection.
+
+```{r}
+# Remove rows with missing values for LASSO Regression
+train_set_lasso <- na.omit(train_set)
+test_set_lasso <- na.omit(test_set)
+
+# Prepare data for glmnet
+x_train_lasso <- model.matrix(sum_TOTAL_UNITS_ORDERED_2024 ~ ., train_set_lasso)[, -1]
+y_train_lasso <- train_set_lasso$sum_TOTAL_UNITS_ORDERED_2024
+x_test_lasso <- model.matrix(sum_TOTAL_UNITS_ORDERED_2024 ~ ., test_set_lasso)[, -1]
+
+# LASSO Regression
+lasso_model <- cv.glmnet(x_train_lasso, y_train_lasso, alpha = 1)
+lasso_predictions <- predict(lasso_model, s = "lambda.min", newx = x_test_lasso)
+
+rmse_lasso <- RMSE(lasso_predictions, test_set_lasso$sum_TOTAL_UNITS_ORDERED_2024)
+r_squared_lasso <- R2(lasso_predictions, test_set_lasso$sum_TOTAL_UNITS_ORDERED_2024)
+mape_lasso <- mean(abs((test_set_lasso$sum_TOTAL_UNITS_ORDERED_2024 - lasso_predictions) / test_set_lasso$sum_TOTAL_UNITS_ORDERED_2024)) * 100
+
+cat("LASSO Regression Model Performance:\n")
+cat("RMSE:", rmse_lasso, "\n")
+cat("R-squared:", r_squared_lasso, "\n")
+cat("MAPE:", mape_lasso, "\n")
+```
+
+LASSO Regression Performance Discussion:
+
+ - *RMSE (Root Mean Squared Error)*: An RMSE of 2148.187 indicates that, on average, the predictions are off by about 2,148 units. This is a substantial improvement over the Ridge Regression model, suggesting that the LASSO Regression model is highly accurate.
+
+ - *R-squared*: An R-squared value of 0.9065579 means that approximately 90.7% of the variance in the target variable is explained by the LASSO Regression model. This is a very high value, indicating that the model fits the data exceptionally well.
+
+ - *MAPE (Mean Absolute Percentage Error)*: An infinite MAPE suggests that there are some actual values that are zero, leading to division by zero in the calculation. This indicates that the LASSO Regression model is not suitable for datasets with zero values in the target variable.
+
+### Elastic Net Regression
+
+Elastic net combines both L1 and L2 penalties, providing a balance between Ridge and LASSO, making it effective in handling multicollinearity and feature selection.
+
+```{r}
+# Remove rows with missing values for Elastic Net Regression
+train_set_enet <- na.omit(train_set)
+test_set_enet <- na.omit(test_set)
+
+# Prepare data for glmnet
+x_train_enet <- model.matrix(sum_TOTAL_UNITS_ORDERED_2024 ~ ., train_set_enet)[, -1]
+y_train_enet <- train_set_enet$sum_TOTAL_UNITS_ORDERED_2024
+x_test_enet <- model.matrix(sum_TOTAL_UNITS_ORDERED_2024 ~ ., test_set_enet)[, -1]
+
+# Elastic Net Regression
+alpha_value <- 0.5 # Adjust this value to control the balance between LASSO and Ridge
+enet_model <- cv.glmnet(x_train_enet, y_train_enet, alpha = alpha_value)
+enet_predictions <- predict(enet_model, s = "lambda.min", newx = x_test_enet)
+
+rmse_enet <- RMSE(enet_predictions, test_set_enet$sum_TOTAL_UNITS_ORDERED_2024)
+r_squared_enet <- R2(enet_predictions, test_set_enet$sum_TOTAL_UNITS_ORDERED_2024)
+mape_enet <- mean(abs((test_set_enet$sum_TOTAL_UNITS_ORDERED_2024 - enet_predictions) / test_set_enet$sum_TOTAL_UNITS_ORDERED_2024)) * 100
+
+cat("Elastic Net Regression Model Performance:\n")
+cat("RMSE:", rmse_enet, "\n")
+cat("R-squared:", r_squared_enet, "\n")
+cat("MAPE:", mape_enet, "\n")
+```
+
+Elastic Net Regression Performance Discussion:
+
+ - *RMSE (Root Mean Squared Error)*: An RMSE of 2208.549 indicates that, on average, the predictions are off by about 2,209 units. This is very close to the LASSO Regression model's RMSE, suggesting that the Elastic Net Regression model is also highly accurate.
+
+ - *R-squared*: An R-squared value of 0.9012239 means that approximately 90.1% of the variance in the target variable is explained by the Elastic Net Regression model. This is a very high value, indicating that the model fits the data exceptionally well.
+
+ - *MAPE (Mean Absolute Percentage Error)*: An infinite MAPE suggests that there are some actual values that are zero, leading to division by zero in the calculation. This indicates that the Elastic Net Regression model is not suitable for datasets with zero values in the target variable.
+
+# Evaluation 
+
+In this section we will evaluate the strengths and weaknesses of each model and select the best one. 
+
+**Performance Benchmark: Mean and Median Models**
+
+- Both performance benchmark models perform poorly, with high RMSE and negative R-squared values, indicating that they do not explain the variance in the data well.
+
+**Ridge Regression**
+
+- Shows significant improvement over the mean and median models, with a higher R-squared value.
+
+**LASSO Regression**
+
+- Performs better than the Ridge model, with a lower RMSE and higher R-squared value, indicating a better fit to the data than the baseline and Ridge models.
+
+**Elastic Net Regression**
+
+- Similar performance to LASSO, indicating a relatively good fit to the data. 
+
+The LASSO Regression model performed the best with an RMSE of 2,148 and an R-squared of 0.91. If we had to select the best model, this is the one we would select.
+
+# Business Validation & Next Steps
+
+Despite the advanced modeling techniques employed, including Ridge, LASSO, and Elastic Net regression, the Root Mean Squared Error (RMSE) for the best-performing models remains above 400 units. This is significant because the client currently uses 400 units per year as a threshold to distinguish between high and low volume customers. An RMSE exceeding this threshold indicates that the models' predictions are not precise enough to reliably classify customers based on this criterion. Consequently, while the models demonstrate strong overall performance metrics, they fall short in addressing the specific business problem of accurately categorizing customers by volume.
+
+To ensure the team still provides the customer with a useful product, we will next construct a comprehensive Tableau Dashboard. The goal of this dashboard is to help logistics teams and operations managers run "what-if" analyses when determining what threshold to use when classifying deliveries into White Truck vs. Red Truck. In the long-term, dashboard may help automate truck assignments, reduce delivery costs, and improve operational efficiency. Ultimately, the desire is to determine how to integrate the insights into a routine strategy to support long-term growth while maintaining logistical efficiency.
